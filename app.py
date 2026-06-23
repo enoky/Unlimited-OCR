@@ -1,5 +1,6 @@
 import subprocess, sys, os, tempfile
 from threading import Thread
+from typing import Iterator
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Runtime install of exact model-required versions.
@@ -97,7 +98,7 @@ def run_ocr(
     image_path: FileData,
     mode: str = "gundam",
     prompt: str = "document parsing.",
-):
+) -> Iterator[dict]:
     """
     Stream OCR output for one image page token-by-token.
 
