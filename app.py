@@ -41,8 +41,11 @@ model = AutoModel.from_pretrained(
     use_safetensors=True,
     torch_dtype=torch.bfloat16,
 )
-model = model.eval()
-print("Model loaded (on CPU — ZeroGPU allocates GPU per request).")
+# Per ZeroGPU docs: models must be placed on cuda at module level.
+# Outside @spaces.GPU, ZeroGPU runs a PyTorch CUDA emulation mode so
+# this .cuda() call succeeds without a real GPU being present.
+model = model.eval().cuda()
+print("Model loaded on cuda (ZeroGPU emulation at startup).")
 
 # ──────────────────────────────────────────────
 # App setup
@@ -68,7 +71,7 @@ def pdf_to_images(pdf_path: str, dpi: int = 300):
 
 
 @app.api()
-@spaces.GPU
+@spaces.GPU(duration=300)  # single-image OCR can take up to 5 min on long docs
 def run_ocr(
     image_path: FileData,
     mode: str = "gundam",
@@ -125,7 +128,7 @@ def run_ocr(
 
 
 @app.api()
-@spaces.GPU
+@spaces.GPU(duration=600)  # multi-page / PDF parsing can take up to 10 min
 def run_ocr_multi(
     image_paths: list,
     prompt: str = "Multi page parsing.",
