@@ -1,19 +1,15 @@
 import os
-import io
-import base64
 import tempfile
 import torch
-from PIL import Image
 from transformers import AutoModel, AutoTokenizer
 from gradio import Server
 from gradio.data_classes import FileData
-from fastapi import UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-import asyncio
-import json
+from fastapi.responses import HTMLResponse
+import spaces
 
 # ──────────────────────────────────────────────
-# Model loading
+# Model loading  (CPU at startup; ZeroGPU moves
+# it to GPU per-request via @spaces.GPU)
 # ──────────────────────────────────────────────
 MODEL_NAME = "baidu/Unlimited-OCR"
 
@@ -27,9 +23,7 @@ model = AutoModel.from_pretrained(
     torch_dtype=torch.bfloat16,
 )
 model = model.eval()
-if torch.cuda.is_available():
-    model = model.cuda()
-print("Model loaded!")
+print("Model loaded (on CPU — ZeroGPU will allocate GPU per request).")
 
 # ──────────────────────────────────────────────
 # App setup
@@ -55,6 +49,7 @@ def pdf_to_images(pdf_path: str, dpi: int = 300):
 
 
 @app.api()
+@spaces.GPU
 def run_ocr(
     image_path: FileData,
     mode: str = "gundam",
@@ -90,7 +85,7 @@ def run_ocr(
         save_results=True,
     )
 
-    # Collect text results
+    # Collect text results (.txt / .md first, then anything readable)
     result_text = ""
     for fname in sorted(os.listdir(out_dir)):
         if fname.endswith(".txt") or fname.endswith(".md"):
@@ -98,7 +93,6 @@ def run_ocr(
                 result_text += f.read() + "\n"
 
     if not result_text:
-        # Try any file
         for fname in sorted(os.listdir(out_dir)):
             fpath = os.path.join(out_dir, fname)
             if os.path.isfile(fpath):
@@ -112,6 +106,7 @@ def run_ocr(
 
 
 @app.api()
+@spaces.GPU
 def run_ocr_multi(
     image_paths: list,
     prompt: str = "Multi page parsing.",
