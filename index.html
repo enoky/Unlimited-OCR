@@ -172,8 +172,15 @@
     #image-preview { width: 100%; height: 100%; object-fit: contain; background: #000; display: none; }
     #image-preview.visible { display: block; }
 
-    #pdf-pages { display: none; flex-direction: column; align-items: center; gap: 8px; overflow-y: auto; padding: 12px; height: 100%; }
-    #pdf-pages.visible { display: flex; }
+    /* PDF viewer iframe */
+    #pdf-viewer {
+      display: none;
+      width: 100%;
+      height: 100%;
+      border: none;
+      background: #fff;
+    }
+    #pdf-viewer.visible { display: block; }
 
     /* ── Output ── */
     .output-area {
@@ -306,7 +313,7 @@
       </div>
 
       <img id="image-preview" alt="Document preview" />
-      <div id="pdf-pages"></div>
+      <iframe id="pdf-viewer" title="PDF viewer"></iframe>
 
       <div class="prompt-bar">
         <span class="prompt-label">PROMPT</span>
@@ -413,24 +420,17 @@ function loadFile(file) {
   // Hide drop zone, reset previews
   document.getElementById('drop-zone').style.display = 'none';
   document.getElementById('image-preview').classList.remove('visible');
-  document.getElementById('pdf-pages').classList.remove('visible');
+  document.getElementById('pdf-viewer').classList.remove('visible');
   document.getElementById('zoom-btn').style.display = 'flex';
   document.getElementById('input-type-tag').textContent =
     isPDF ? 'PDF' : file.name.split('.').pop().toUpperCase();
 
   if (isPDF) {
-    const mb = (file.size / 1024 / 1024).toFixed(2);
-    document.getElementById('pdf-pages').innerHTML = `
-      <div style="padding:24px;text-align:center;font-family:var(--font-mono);color:var(--text-secondary)">
-        <div style="font-size:44px;margin-bottom:10px">📄</div>
-        <div style="font-size:13px;color:var(--text-primary)">${file.name}</div>
-        <div style="font-size:11px;margin-top:6px;color:var(--text-muted)">${mb} MB · PDF</div>
-        <div style="margin-top:14px;font-size:10px;color:var(--teal)">
-          Pages extracted server-side (CPU) then<br>
-          OCR'd one per 60-second GPU slot
-        </div>
-      </div>`;
-    document.getElementById('pdf-pages').classList.add('visible');
+    // Render PDF natively in an iframe using a blob object URL
+    const pdfURL = URL.createObjectURL(file);
+    const viewer = document.getElementById('pdf-viewer');
+    viewer.src = pdfURL;
+    viewer.classList.add('visible');
     document.getElementById('page-info').style.display = 'flex';
     document.getElementById('page-count').textContent  = '?';
   } else {
@@ -643,8 +643,8 @@ function clearAll() {
   document.getElementById('drop-zone').style.display      = '';
   const p = document.getElementById('image-preview');
   p.classList.remove('visible'); p.src = '';
-  const d = document.getElementById('pdf-pages');
-  d.classList.remove('visible'); d.innerHTML = '';
+  const v = document.getElementById('pdf-viewer');
+  v.classList.remove('visible'); v.src = '';
   document.getElementById('zoom-btn').style.display       = 'none';
   document.getElementById('input-type-tag').textContent   = 'EMPTY';
   document.getElementById('start-btn').disabled           = true;
