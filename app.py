@@ -1,6 +1,9 @@
 import subprocess, sys, os, tempfile
 from threading import Thread
 from typing import Iterator
+import queue
+import threading
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Runtime install of exact model-required versions.
@@ -92,6 +95,30 @@ def _collect_output(out_dir: str) -> str:
 #
 # ZeroGPU: duration=60 → highest queue priority; one page per call.
 #
+class ThreadTargetedStdout:
+    def __init__(self, target_thread, q, original_stdout):
+        self.target_thread = target_thread
+        self.q = q
+        self.original_stdout = original_stdout
+
+    def write(self, data):
+        self.original_stdout.write(data)
+        self.original_stdout.flush()
+        if threading.current_thread() == self.target_thread:
+            if data:
+                lower_data = data.lower()
+                if "tps:" in lower_data or "tokens/s" in lower_data:
+                    return len(data)
+                self.q.put(data)
+        return len(data)
+
+    def flush(self):
+        self.original_stdout.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.original_stdout, name)
+
+
 @app.api(stream_every=0.1)
 @spaces.GPU(duration=60)
 def run_ocr(
@@ -129,50 +156,56 @@ def run_ocr(
         save_results=True,
     )
 
-    # ── Attempt real token streaming via TextIteratorStreamer ─────────────────
-    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
-    errors   = []
+    q = queue.Queue()
+    errors = []
 
-    def _infer_with_streamer():
+    def _infer_thread():
         try:
-            model.infer(tokenizer, **_infer_kwargs, streamer=streamer)
-        except TypeError:
-            # model.infer() doesn't accept `streamer` kwarg.
-            # Re-run WITHOUT it so output files are actually written,
-            # then signal the streamer loop to end.
-            try:
-                model.infer(tokenizer, **_infer_kwargs)
-            except Exception as e:
-                errors.append(str(e))
-            finally:
-                streamer.end()
+            model.infer(tokenizer, **_infer_kwargs)
         except Exception as e:
             errors.append(str(e))
-            streamer.end()
 
-    thread = Thread(target=_infer_with_streamer, daemon=True)
-    thread.start()
+    thread = Thread(target=_infer_thread, daemon=True)
+
+    original_stdout = sys.stdout
+    targeted_stdout = ThreadTargetedStdout(thread, q, original_stdout)
+    sys.stdout = targeted_stdout
 
     accumulated = ""
-    for token in streamer:          # blocks until next token or end()
-        accumulated += token
-        yield {"text": accumulated, "done": False}
+    try:
+        thread.start()
+        while thread.is_alive() or not q.empty():
+            try:
+                chunk = q.get(timeout=0.02)
+                accumulated += chunk
+                yield {"text": accumulated, "done": False}
+            except queue.Empty:
+                continue
+    finally:
+        sys.stdout = original_stdout
+        thread.join()
 
-    thread.join()
+    # ── Fallback/Final: read file to get clean text ───────────────────────────
+    full_text = _collect_output(out_dir)
 
-    # ── Fallback: streamer not used → read file, stream word-by-word ──────────
-
-    if not accumulated:
-        full_text = _collect_output(out_dir)
-        words     = full_text.split()
-        acc       = ""
-        for i, word in enumerate(words):
-            acc += ("" if i == 0 else " ") + word
-            if i % 5 == 0:                 # emit every 5 words
-                yield {"text": acc, "done": False}
-        yield {"text": full_text, "done": True}
+    if accumulated:
+        if full_text:
+            yield {"text": full_text, "done": True}
+        else:
+            yield {"text": accumulated, "done": True}
     else:
-        yield {"text": accumulated, "done": True}
+        if full_text:
+            words = full_text.split()
+            acc = ""
+            for i, word in enumerate(words):
+                acc += ("" if i == 0 else " ") + word
+                if i % 5 == 0:
+                    yield {"text": acc, "done": False}
+            yield {"text": full_text, "done": True}
+        else:
+            if errors:
+                raise RuntimeError(f"Inference failed: {', '.join(errors)}")
+            yield {"text": "", "done": True}
 
 
 # ── PDF explode — CPU only, no GPU ───────────────────────────────────────────
