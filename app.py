@@ -26,10 +26,13 @@ from gradio.data_classes import FileData
 from fastapi.responses import HTMLResponse
 import spaces
 
-# ──────────────────────────────────────────────
-# Model loading  (CPU at startup; ZeroGPU moves
-# it to GPU per-request via @spaces.GPU)
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Model loading
+# Per ZeroGPU docs: place model on cuda at module level.
+# ZeroGPU runs PyTorch CUDA emulation outside @spaces.GPU, so .cuda() works
+# at startup without a real GPU. Moving to cuda here is more efficient than
+# doing it lazily inside @spaces.GPU (CUDA transfers are optimised at startup).
+# ──────────────────────────────────────────────────────────────────────────────
 MODEL_NAME = "baidu/Unlimited-OCR"
 
 print("Loading tokenizer...")
@@ -40,24 +43,19 @@ model = AutoModel.from_pretrained(
     trust_remote_code=True,
     use_safetensors=True,
     torch_dtype=torch.bfloat16,
-)
-# Per ZeroGPU docs: models must be placed on cuda at module level.
-# Outside @spaces.GPU, ZeroGPU runs a PyTorch CUDA emulation mode so
-# this .cuda() call succeeds without a real GPU being present.
-model = model.eval().cuda()
-print("Model loaded on cuda (ZeroGPU emulation at startup).")
+).eval().cuda()
+print("Model ready.")
 
-# ──────────────────────────────────────────────
-# App setup
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# App
+# ──────────────────────────────────────────────────────────────────────────────
 app = Server()
 
 
-def pdf_to_images(pdf_path: str, dpi: int = 300):
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        raise ImportError("pymupdf is required for PDF support: pip install pymupdf")
+# ── PDF helper (CPU-only, no GPU needed) ──────────────────────────────────────
+def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
+    """Convert every page of a PDF to a PNG. Returns list of file paths."""
+    import fitz
     doc = fitz.open(pdf_path)
     tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
     mat = fitz.Matrix(dpi / 72, dpi / 72)
@@ -70,28 +68,31 @@ def pdf_to_images(pdf_path: str, dpi: int = 300):
     return paths
 
 
+# ── Single-page OCR — the only GPU endpoint ───────────────────────────────────
+# ZeroGPU tip: shorter duration = higher queue priority.
+# Process ONE page per call so each GPU slot is brief and shared fairly.
+# For PDFs the frontend calls this endpoint once per page and streams results.
 @app.api()
-@spaces.GPU(duration=300)  # single-image OCR can take up to 5 min on long docs
+@spaces.GPU(duration=60)          # 60 s default = highest queue priority
 def run_ocr(
     image_path: FileData,
-    mode: str = "gundam",
+    mode: str = "gundam",         # gundam (640 px crop) is faster; base = 1024 px
     prompt: str = "document parsing.",
 ) -> dict:
     """
-    Run OCR on a single image.
+    OCR one image page.
 
-    mode: 'gundam' (crop, fast) or 'base' (full-res, accurate)
-    Returns a dict with 'text' key containing the OCR result.
+    mode: 'gundam' — fast (image_size=640, crop_mode=True)  ← default, ZeroGPU-friendly
+          'base'   — accurate (image_size=1024, crop_mode=False)
+    Returns {'text': str}.
     """
     path = image_path["path"]
     out_dir = tempfile.mkdtemp(prefix="ocr_out_")
 
     if mode == "gundam":
-        base_size, image_size, crop_mode = 1024, 640, True
-        ngram_window = 128
+        base_size, image_size, crop_mode, ngram_window = 1024, 640, True, 128
     else:
-        base_size, image_size, crop_mode = 1024, 1024, False
-        ngram_window = 128
+        base_size, image_size, crop_mode, ngram_window = 1024, 1024, False, 128
 
     model.infer(
         tokenizer,
@@ -101,16 +102,15 @@ def run_ocr(
         base_size=base_size,
         image_size=image_size,
         crop_mode=crop_mode,
-        max_length=32768,
+        max_length=8192,           # per-page cap — keeps GPU slot short
         no_repeat_ngram_size=35,
         ngram_window=ngram_window,
         save_results=True,
     )
 
-    # Collect text results (.txt / .md first, then anything readable)
     result_text = ""
     for fname in sorted(os.listdir(out_dir)):
-        if fname.endswith(".txt") or fname.endswith(".md"):
+        if fname.endswith((".txt", ".md")):
             with open(os.path.join(out_dir, fname), "r", encoding="utf-8") as f:
                 result_text += f.read() + "\n"
 
@@ -127,44 +127,19 @@ def run_ocr(
     return {"text": result_text.strip()}
 
 
+# ── PDF explode — CPU only, no GPU ───────────────────────────────────────────
 @app.api()
-@spaces.GPU(duration=600)  # multi-page / PDF parsing can take up to 10 min
-def run_ocr_multi(
-    image_paths: list,
-    prompt: str = "Multi page parsing.",
-) -> dict:
+def explode_pdf(pdf_file: FileData) -> dict:
     """
-    Run OCR on multiple images / PDF pages (base mode only).
-    Returns a dict with 'text' key.
+    Convert a PDF to a list of per-page image paths.
+    Returns {'pages': [FileData, ...]} so the frontend can call
+    run_ocr once per page, keeping each GPU slot short.
     """
-    paths = [fp["path"] for fp in image_paths]
-    out_dir = tempfile.mkdtemp(prefix="ocr_out_")
-
-    model.infer_multi(
-        tokenizer,
-        prompt=f"<image>{prompt}",
-        image_files=paths,
-        output_path=out_dir,
-        image_size=1024,
-        max_length=32768,
-        no_repeat_ngram_size=35,
-        ngram_window=1024,
-        save_results=True,
-    )
-
-    result_text = ""
-    for fname in sorted(os.listdir(out_dir)):
-        fpath = os.path.join(out_dir, fname)
-        if os.path.isfile(fpath):
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    result_text += f.read() + "\n"
-            except Exception:
-                pass
-
-    return {"text": result_text.strip()}
+    pages = pdf_to_images(pdf_file["path"], dpi=200)
+    return {"pages": [{"path": p, "orig_name": os.path.basename(p)} for p in pages]}
 
 
+# ── Static frontend ───────────────────────────────────────────────────────────
 @app.get("/")
 async def homepage():
     html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
