@@ -172,15 +172,25 @@
     #image-preview { width: 100%; height: 100%; object-fit: contain; background: #000; display: none; }
     #image-preview.visible { display: block; }
 
-    /* PDF viewer iframe */
-    #pdf-viewer {
+    /* PDF.js canvas viewer */
+    #pdf-canvas-wrap {
       display: none;
-      width: 100%;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      overflow-y: auto;
+      padding: 12px;
       height: 100%;
-      border: none;
-      background: #fff;
+      background: #525659;
     }
-    #pdf-viewer.visible { display: block; }
+    #pdf-canvas-wrap.visible { display: flex; }
+    #pdf-canvas-wrap canvas {
+      display: block;
+      width: 100%;
+      max-width: 680px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.6);
+      border-radius: 2px;
+    }
 
     /* ── Output ── */
     .output-area {
@@ -313,7 +323,7 @@
       </div>
 
       <img id="image-preview" alt="Document preview" />
-      <iframe id="pdf-viewer" title="PDF viewer"></iframe>
+      <div id="pdf-canvas-wrap"></div>
 
       <div class="prompt-bar">
         <span class="prompt-label">PROMPT</span>
@@ -353,6 +363,9 @@
 
 <script type="module">
 import { Client, handle_file } from "https://cdn.jsdelivr.net/npm/@gradio/client/dist/index.min.js";
+import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs";
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs";
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let client        = null;
@@ -413,26 +426,40 @@ window.scrollOutputBottom = () => {
 };
 
 // ── File loading ──────────────────────────────────────────────────────────────
-function loadFile(file) {
+async function loadFile(file) {
   currentFile = file;
   isPDF = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
 
   // Hide drop zone, reset previews
   document.getElementById('drop-zone').style.display = 'none';
   document.getElementById('image-preview').classList.remove('visible');
-  document.getElementById('pdf-viewer').classList.remove('visible');
+  document.getElementById('pdf-canvas-wrap').classList.remove('visible');
   document.getElementById('zoom-btn').style.display = 'flex';
   document.getElementById('input-type-tag').textContent =
     isPDF ? 'PDF' : file.name.split('.').pop().toUpperCase();
 
   if (isPDF) {
-    // Render PDF natively in an iframe using a blob object URL
-    const pdfURL = URL.createObjectURL(file);
-    const viewer = document.getElementById('pdf-viewer');
-    viewer.src = pdfURL;
-    viewer.classList.add('visible');
+    // Render PDF pages with PDF.js into canvases (blob: URLs are blocked in iframes on HTTPS)
+    const wrap = document.getElementById('pdf-canvas-wrap');
+    wrap.innerHTML = '<div style="color:var(--teal);font-family:var(--font-mono);font-size:11px;padding:20px">Rendering PDF…</div>';
+    wrap.classList.add('visible');
     document.getElementById('page-info').style.display = 'flex';
-    document.getElementById('page-count').textContent  = '?';
+
+    const buffer = await file.arrayBuffer();
+    const pdf    = await pdfjsLib.getDocument({ data: buffer }).promise;
+    const total  = pdf.numPages;
+    document.getElementById('page-count').textContent = total;
+    wrap.innerHTML = '';
+
+    for (let i = 1; i <= total; i++) {
+      const page     = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 2.0 });
+      const canvas   = document.createElement('canvas');
+      canvas.width   = viewport.width;
+      canvas.height  = viewport.height;
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+      wrap.appendChild(canvas);
+    }
   } else {
     const preview = document.getElementById('image-preview');
     preview.src = URL.createObjectURL(file);
@@ -643,8 +670,8 @@ function clearAll() {
   document.getElementById('drop-zone').style.display      = '';
   const p = document.getElementById('image-preview');
   p.classList.remove('visible'); p.src = '';
-  const v = document.getElementById('pdf-viewer');
-  v.classList.remove('visible'); v.src = '';
+  const v = document.getElementById('pdf-canvas-wrap');
+  v.classList.remove('visible'); v.innerHTML = '';
   document.getElementById('zoom-btn').style.display       = 'none';
   document.getElementById('input-type-tag').textContent   = 'EMPTY';
   document.getElementById('start-btn').disabled           = true;
