@@ -480,20 +480,30 @@ async function startOCR() {
   }
 }
 
-// ── Single image — one 60-second GPU slot ─────────────────────────────────────
+// ── Single image — streaming via client.submit() ────────────────────────────
 async function runSingleImage(ocrDiv, prompt, mode) {
   ocrDiv.innerHTML = '<span class="cursor"></span>';
   setStatus('running', 'IN GPU QUEUE…');
+
+  const submission = client.submit('/run_ocr', {
+    image_path: handle_file(currentFile),
+    mode,
+    prompt,
+  });
+
+  let finalText = '';
   try {
-    const res = await client.predict('/run_ocr', {
-      image_path: handle_file(currentFile),
-      mode,
-      prompt,
-    });
-    if (stopRequested) return finishStop(ocrDiv);
-    const text = res?.data?.[0]?.text ?? '';
-    ocrDiv.textContent = text;
-    finishDone(text);
+    for await (const msg of submission) {
+      if (stopRequested) { submission.cancel(); return finishStop(ocrDiv); }
+      if (msg.type === 'data') {
+        const chunk = msg.data?.[0]?.text ?? msg.data?.[0] ?? '';
+        finalText = chunk;
+        ocrDiv.textContent = chunk;
+        window.scrollOutputBottom();
+      }
+      if (msg.type === 'status' && msg.stage === 'complete') break;
+    }
+    finishDone(finalText);
   } catch (err) {
     if (stopRequested) return finishStop(ocrDiv);
     showError(ocrDiv, err.message);
@@ -552,23 +562,30 @@ async function runPDF(ocrDiv, prompt, mode) {
     ocrDiv.appendChild(slot);
     window.scrollOutputBottom();
 
+    // Stream each page token-by-token using client.submit()
+    const pageSub = client.submit('/run_ocr', {
+      image_path: { path: pages[i].path, orig_name: pages[i].orig_name },
+      mode,
+      prompt,
+    });
     try {
-      const pageRes = await client.predict('/run_ocr', {
-        image_path: { path: pages[i].path, orig_name: pages[i].orig_name },
-        mode,
-        prompt,
-      });
-      if (stopRequested) { slot.remove(); return finishStop(ocrDiv); }
-
-      const pageText = pageRes?.data?.[0]?.text ?? '';
-      slot.style.color = 'var(--text-primary)';
-      slot.innerHTML   = '';
-      slot.textContent = pageText || '(no text detected)';
+      let pageText = '';
+      for await (const msg of pageSub) {
+        if (stopRequested) { pageSub.cancel(); slot.remove(); return finishStop(ocrDiv); }
+        if (msg.type === 'data') {
+          pageText = msg.data?.[0]?.text ?? msg.data?.[0] ?? '';
+          slot.style.color = 'var(--text-primary)';
+          slot.innerHTML   = '';
+          slot.textContent = pageText;
+          window.scrollOutputBottom();
+        }
+        if (msg.type === 'status' && msg.stage === 'complete') break;
+      }
       fullText  += (fullText ? '\n\n' : '') + pageText;
       charCount  = fullText.length;
       document.getElementById('char-count').textContent      = charCount.toLocaleString();
       document.getElementById('token-display').style.display = 'flex';
-      window.scrollOutputBottom();
+      if (!pageText) slot.textContent = '(no text detected)';
     } catch (err) {
       if (stopRequested) return finishStop(ocrDiv);
       slot.innerHTML = `<span style="color:var(--red)">Page ${i + 1} error: ${err.message}</span>`;

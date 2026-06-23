@@ -1,9 +1,10 @@
 import subprocess, sys, os, tempfile
+from threading import Thread
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Runtime install of exact model-required versions.
-# Done here (not requirements.txt) to avoid a huggingface-hub version conflict
-# between transformers==4.57.1 (<1.0) and gradio 6.x (>=1.2.0) at build time.
+# Done here (not requirements.txt) to avoid a huggingface-hub conflict between
+# transformers==4.57.1 (<1.0) and gradio 6.x (>=1.2.0) at build time.
 # ──────────────────────────────────────────────────────────────────────────────
 _RUNTIME_PKGS = [
     "torch==2.10.0",
@@ -20,7 +21,7 @@ print("Runtime deps installed.")
 
 # ── Now safe to import ────────────────────────────────────────────────────────
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, TextIteratorStreamer
 from gradio import Server
 from gradio.data_classes import FileData
 from fastapi.responses import HTMLResponse
@@ -29,9 +30,7 @@ import spaces
 # ──────────────────────────────────────────────────────────────────────────────
 # Model loading
 # Per ZeroGPU docs: place model on cuda at module level.
-# ZeroGPU runs PyTorch CUDA emulation outside @spaces.GPU, so .cuda() works
-# at startup without a real GPU. Moving to cuda here is more efficient than
-# doing it lazily inside @spaces.GPU (CUDA transfers are optimised at startup).
+# ZeroGPU emulation mode lets .cuda() work at startup without a real GPU.
 # ──────────────────────────────────────────────────────────────────────────────
 MODEL_NAME = "baidu/Unlimited-OCR"
 
@@ -46,13 +45,10 @@ model = AutoModel.from_pretrained(
 ).eval().cuda()
 print("Model ready.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# App
-# ──────────────────────────────────────────────────────────────────────────────
 app = Server()
 
 
-# ── PDF helper (CPU-only, no GPU needed) ──────────────────────────────────────
+# ── PDF helper — CPU only ─────────────────────────────────────────────────────
 def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
     """Convert every page of a PDF to a PNG. Returns list of file paths."""
     import fitz
@@ -68,72 +64,113 @@ def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[str]:
     return paths
 
 
-# ── Single-page OCR — the only GPU endpoint ───────────────────────────────────
-# ZeroGPU tip: shorter duration = higher queue priority.
-# Process ONE page per call so each GPU slot is brief and shared fairly.
-# For PDFs the frontend calls this endpoint once per page and streams results.
-@app.api()
-@spaces.GPU(duration=60)          # 60 s default = highest queue priority
-def run_ocr(
-    image_path: FileData,
-    mode: str = "gundam",         # gundam (640 px crop) is faster; base = 1024 px
-    prompt: str = "document parsing.",
-) -> dict:
-    """
-    OCR one image page.
-
-    mode: 'gundam' — fast (image_size=640, crop_mode=True)  ← default, ZeroGPU-friendly
-          'base'   — accurate (image_size=1024, crop_mode=False)
-    Returns {'text': str}.
-    """
-    path = image_path["path"]
-    out_dir = tempfile.mkdtemp(prefix="ocr_out_")
-
-    if mode == "gundam":
-        base_size, image_size, crop_mode, ngram_window = 1024, 640, True, 128
-    else:
-        base_size, image_size, crop_mode, ngram_window = 1024, 1024, False, 128
-
-    model.infer(
-        tokenizer,
-        prompt=f"<image>{prompt}",
-        image_file=path,
-        output_path=out_dir,
-        base_size=base_size,
-        image_size=image_size,
-        crop_mode=crop_mode,
-        max_length=8192,           # per-page cap — keeps GPU slot short
-        no_repeat_ngram_size=35,
-        ngram_window=ngram_window,
-        save_results=True,
-    )
-
-    result_text = ""
+def _collect_output(out_dir: str) -> str:
+    """Read all text/markdown files written by model.infer()."""
+    result = ""
     for fname in sorted(os.listdir(out_dir)):
         if fname.endswith((".txt", ".md")):
             with open(os.path.join(out_dir, fname), "r", encoding="utf-8") as f:
-                result_text += f.read() + "\n"
-
-    if not result_text:
+                result += f.read() + "\n"
+    if not result:
         for fname in sorted(os.listdir(out_dir)):
             fpath = os.path.join(out_dir, fname)
             if os.path.isfile(fpath):
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
-                        result_text += f.read() + "\n"
+                        result += f.read() + "\n"
                 except Exception:
                     pass
+    return result.strip()
 
-    return {"text": result_text.strip()}
+
+# ── Single-page OCR — streaming generator ────────────────────────────────────
+#
+# Gradio docs: any generator decorated with @app.api() automatically streams
+# each yielded value to the client via SSE.  stream_every=0.1 means values
+# are flushed at most every 100 ms.
+#
+# ZeroGPU: duration=60 → highest queue priority; one page per call.
+#
+@app.api(stream_every=0.1)
+@spaces.GPU(duration=60)
+def run_ocr(
+    image_path: FileData,
+    mode: str = "gundam",
+    prompt: str = "document parsing.",
+):
+    """
+    Stream OCR output for one image page token-by-token.
+
+    Yields dicts: {"text": str, "done": bool}
+
+    mode: 'gundam' — fast (640 px crop)   ← ZeroGPU-friendly default
+          'base'   — accurate (1024 px)
+    """
+    path    = image_path["path"]
+    out_dir = tempfile.mkdtemp(prefix="ocr_out_")
+
+    if mode == "gundam":
+        base_size, image_size, crop_mode, ngram_window = 1024, 640,  True,  128
+    else:
+        base_size, image_size, crop_mode, ngram_window = 1024, 1024, False, 128
+
+    # ── Attempt real token streaming via TextIteratorStreamer ─────────────────
+    streamer    = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
+    errors      = []
+
+    def _infer_with_streamer():
+        try:
+            model.infer(
+                tokenizer,
+                prompt=f"<image>{prompt}",
+                image_file=path,
+                output_path=out_dir,
+                base_size=base_size,
+                image_size=image_size,
+                crop_mode=crop_mode,
+                max_length=8192,
+                no_repeat_ngram_size=35,
+                ngram_window=ngram_window,
+                save_results=True,
+                streamer=streamer,        # passed through to model.generate()
+            )
+        except TypeError:
+            # model.infer() doesn't accept streamer kwarg → signal done
+            streamer.end()
+        except Exception as e:
+            errors.append(str(e))
+            streamer.end()
+
+    thread = Thread(target=_infer_with_streamer, daemon=True)
+    thread.start()
+
+    accumulated = ""
+    for token in streamer:          # blocks until next token or end
+        accumulated += token
+        yield {"text": accumulated, "done": False}
+
+    thread.join()
+
+    # ── Fallback: streamer not used → read file, stream word-by-word ──────────
+    if not accumulated:
+        full_text = _collect_output(out_dir)
+        words     = full_text.split()
+        acc       = ""
+        for i, word in enumerate(words):
+            acc += ("" if i == 0 else " ") + word
+            if i % 5 == 0:                 # emit every 5 words
+                yield {"text": acc, "done": False}
+        yield {"text": full_text, "done": True}
+    else:
+        yield {"text": accumulated, "done": True}
 
 
 # ── PDF explode — CPU only, no GPU ───────────────────────────────────────────
 @app.api()
 def explode_pdf(pdf_file: FileData) -> dict:
     """
-    Convert a PDF to a list of per-page image paths.
-    Returns {'pages': [FileData, ...]} so the frontend can call
-    run_ocr once per page, keeping each GPU slot short.
+    Convert a PDF into per-page image paths (CPU only — no GPU wasted on I/O).
+    The frontend then calls run_ocr once per page, keeping each GPU slot to 60 s.
     """
     pages = pdf_to_images(pdf_file["path"], dpi=200)
     return {"pages": [{"path": p, "orig_name": os.path.basename(p)} for p in pages]}
