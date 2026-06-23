@@ -1,13 +1,9 @@
-# torch/torchvision — let the Space runtime supply a CUDA-compatible build
-torch
-torchvision
-# transformers — must be >=4.50 for Unlimited-OCR; leave upper bound open so
-# pip can pick a version whose huggingface-hub pin doesn't conflict with gradio
-transformers>=4.50.0
-Pillow>=10.0.0
+# Build-time deps only — gradio-compatible, no transformers version conflict.
+# The exact model-required versions are pip-installed at runtime in app.py.
+matplotlib>=3.7.0
 einops>=0.8.0
 addict>=2.4.0
 easydict>=1.13
 pymupdf>=1.27.0
 psutil>=5.9.0
-matplotlib>=3.7.0
+Pillow>=10.0.0

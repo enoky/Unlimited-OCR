@@ -1,5 +1,24 @@
-import os
-import tempfile
+import subprocess, sys, os, tempfile
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Runtime install of exact model-required versions.
+# Done here (not requirements.txt) to avoid a huggingface-hub version conflict
+# between transformers==4.57.1 (<1.0) and gradio 6.x (>=1.2.0) at build time.
+# ──────────────────────────────────────────────────────────────────────────────
+_RUNTIME_PKGS = [
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "transformers==4.57.1",
+]
+
+print("Installing pinned runtime dependencies...")
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir"] + _RUNTIME_PKGS,
+    check=True,
+)
+print("Runtime deps installed.")
+
+# ── Now safe to import ────────────────────────────────────────────────────────
 import torch
 from transformers import AutoModel, AutoTokenizer
 from gradio import Server
@@ -23,7 +42,7 @@ model = AutoModel.from_pretrained(
     torch_dtype=torch.bfloat16,
 )
 model = model.eval()
-print("Model loaded (on CPU — ZeroGPU will allocate GPU per request).")
+print("Model loaded (on CPU — ZeroGPU allocates GPU per request).")
 
 # ──────────────────────────────────────────────
 # App setup
