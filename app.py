@@ -115,29 +115,37 @@ def run_ocr(
     else:
         base_size, image_size, crop_mode, ngram_window = 1024, 1024, False, 128
 
+    # ── Common infer kwargs ───────────────────────────────────────────────────
+    _infer_kwargs = dict(
+        prompt=f"<image>{prompt}",
+        image_file=path,
+        output_path=out_dir,
+        base_size=base_size,
+        image_size=image_size,
+        crop_mode=crop_mode,
+        max_length=8192,
+        no_repeat_ngram_size=35,
+        ngram_window=ngram_window,
+        save_results=True,
+    )
+
     # ── Attempt real token streaming via TextIteratorStreamer ─────────────────
-    streamer    = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
-    errors      = []
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
+    errors   = []
 
     def _infer_with_streamer():
         try:
-            model.infer(
-                tokenizer,
-                prompt=f"<image>{prompt}",
-                image_file=path,
-                output_path=out_dir,
-                base_size=base_size,
-                image_size=image_size,
-                crop_mode=crop_mode,
-                max_length=8192,
-                no_repeat_ngram_size=35,
-                ngram_window=ngram_window,
-                save_results=True,
-                streamer=streamer,        # passed through to model.generate()
-            )
+            model.infer(tokenizer, **_infer_kwargs, streamer=streamer)
         except TypeError:
-            # model.infer() doesn't accept streamer kwarg → signal done
-            streamer.end()
+            # model.infer() doesn't accept `streamer` kwarg.
+            # Re-run WITHOUT it so output files are actually written,
+            # then signal the streamer loop to end.
+            try:
+                model.infer(tokenizer, **_infer_kwargs)
+            except Exception as e:
+                errors.append(str(e))
+            finally:
+                streamer.end()
         except Exception as e:
             errors.append(str(e))
             streamer.end()
@@ -146,13 +154,14 @@ def run_ocr(
     thread.start()
 
     accumulated = ""
-    for token in streamer:          # blocks until next token or end
+    for token in streamer:          # blocks until next token or end()
         accumulated += token
         yield {"text": accumulated, "done": False}
 
     thread.join()
 
     # ── Fallback: streamer not used → read file, stream word-by-word ──────────
+
     if not accumulated:
         full_text = _collect_output(out_dir)
         words     = full_text.split()
