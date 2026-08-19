@@ -1,0 +1,4 @@
+# Local virtualenv - never push this to the Space
+.venv/
+__pycache__/
+*.pyc
