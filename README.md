@@ -177,8 +177,23 @@ refreshing them.
 ## Credits
 
 - Model and original Space — [Baidu](https://huggingface.co/baidu/Unlimited-OCR).
-  The model carries its own licence in the model repository.
 - This fork only changes packaging and hosting.
+
+## Licence
+
+The code in this repository is [MIT](LICENSE). That covers the packaging and
+hosting changes only — it does not relicense anything bundled with them:
+
+| Component | Licence |
+|---|---|
+| **Unlimited-OCR model weights** | Baidu's own terms, in the [model repository](https://huggingface.co/baidu/Unlimited-OCR) — not covered by this repo's licence |
+| `vendor/pdf.min.mjs`, `pdf.worker.min.mjs`, `pdfjs/` | Apache-2.0 (pdf.js) |
+| `vendor/pdfjs/standard_fonts/` | Foxit and Liberation terms — texts vendored alongside them |
+| `vendor/gradio-client.min.js` | ISC (`@gradio/client`) |
+| `vendor/fonts/` | SIL OFL 1.1 — texts vendored alongside them |
+
+If you redistribute this, the model weights are the part to check: they are
+downloaded at runtime rather than committed here, so they are easy to overlook.
 
 > **Note:** the Hugging Face Space config front matter that used to head this
 > file has been removed, since this repository's remote is GitHub and the front
