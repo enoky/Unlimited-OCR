@@ -144,6 +144,7 @@ def run_ocr(
     image_path: FileData,
     mode: str = "gundam",
     prompt: str = "document parsing.",
+    use_ngram: bool = True,
 ) -> Iterator[dict]:
     """
     Stream OCR output for one image page token-by-token.
@@ -152,6 +153,12 @@ def run_ocr(
 
     mode: 'gundam' — fast (640 px crop)   ← ZeroGPU-friendly default
           'base'   — accurate (1024 px)
+
+    use_ngram: repetition guard. On, decoding may not re-emit any 35-token
+        sequence seen in the last 128 tokens, which is what stops a dense page
+        collapsing into a line repeated forever. Turn it off when a page
+        legitimately repeats itself — a table column of identical values, say —
+        and the guard suppresses content that should be there.
     """
     path    = image_path["path"]
     out_dir = tempfile.mkdtemp(prefix="ocr_out_")
@@ -170,7 +177,9 @@ def run_ocr(
         image_size=image_size,
         crop_mode=crop_mode,
         max_length=8192,
-        no_repeat_ngram_size=35,
+        # 0 disables the guard entirely: model.infer only installs the
+        # SlidingWindowNoRepeatNgramProcessor when this is > 0.
+        no_repeat_ngram_size=35 if use_ngram else 0,
         ngram_window=ngram_window,
         save_results=True,
     )

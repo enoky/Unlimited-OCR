@@ -90,6 +90,10 @@ Drop in a PNG, JPG, WEBP, TIFF or PDF and press **START**.
 - **Base** — single 1024 px view, slower, better on sparse or low-contrast scans.
 - **Prompt** — defaults to `document parsing.`. Try `Free OCR.` for plain text
   with no layout markup, or `Parse the figure.` for charts.
+- **NGRAM** — repetition guard, on by default. It forbids re-emitting any
+  35-token sequence from the last 128 tokens, which is what stops a dense page
+  collapsing into one line repeated forever. Switch it off if a page genuinely
+  repeats itself and the guard is swallowing content that should be there.
 
 PDFs are split server-side into per-page PNGs by PyMuPDF, then OCR'd one page at
 a time so long documents stream progressively instead of blocking.

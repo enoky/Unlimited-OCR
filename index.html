@@ -503,13 +503,18 @@ async function startOCR() {
   // Long mode → gundam (640px crop, fast, ZeroGPU-friendly)
   // Base mode → base (1024px, more accurate)
   const mode   = currentMode === 'long' ? 'gundam' : 'base';
+  // Repetition guard. On, the model may not re-emit any 35-token sequence from
+  // the last 128 tokens — that is what keeps a dense page from collapsing into
+  // one line repeated forever. Off is for pages that genuinely repeat, such as
+  // a table column of identical values.
+  const useNgram = document.getElementById('ngram-toggle').checked;
   const ocrDiv = document.getElementById('ocr-text');
 
   try {
     if (isPDF) {
-      await runPDF(ocrDiv, prompt, mode);
+      await runPDF(ocrDiv, prompt, mode, useNgram);
     } else {
-      await runSingleImage(ocrDiv, prompt, mode);
+      await runSingleImage(ocrDiv, prompt, mode, useNgram);
     }
   } finally {
     isRunning = false;
@@ -520,7 +525,7 @@ async function startOCR() {
 }
 
 // ── Single image — streaming via client.submit() ────────────────────────────
-async function runSingleImage(ocrDiv, prompt, mode) {
+async function runSingleImage(ocrDiv, prompt, mode, useNgram) {
   ocrDiv.innerHTML = '<span class="cursor"></span>';
   setStatus('running', 'IN GPU QUEUE…');
 
@@ -528,6 +533,7 @@ async function runSingleImage(ocrDiv, prompt, mode) {
     image_path: handle_file(currentFile),
     mode,
     prompt,
+    use_ngram: useNgram,
   });
 
   let finalText = '';
@@ -556,7 +562,7 @@ async function runSingleImage(ocrDiv, prompt, mode) {
 //   • One page/call = multiple users can be served concurrently
 //   • PDF extraction is CPU-only (no GPU wasted on I/O)
 //
-async function runPDF(ocrDiv, prompt, mode) {
+async function runPDF(ocrDiv, prompt, mode, useNgram) {
   setStatus('running', 'EXTRACTING PDF PAGES (CPU)…');
   ocrDiv.innerHTML = '<span class="cursor"></span>';
 
@@ -606,6 +612,7 @@ async function runPDF(ocrDiv, prompt, mode) {
       image_path: { path: pages[i].path, orig_name: pages[i].orig_name },
       mode,
       prompt,
+      use_ngram: useNgram,
     });
     try {
       let pageText = '';
