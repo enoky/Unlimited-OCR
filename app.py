@@ -1,27 +1,26 @@
-import subprocess, sys, os, tempfile
+import mimetypes
+import sys, os, tempfile
 from threading import Thread
 from typing import Iterator
 import queue
 import threading
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Runtime install of exact model-required versions.
-# Done here (not requirements.txt) to avoid a huggingface-hub conflict between
-# transformers==4.57.1 (<1.0) and gradio 6.x (>=1.2.0) at build time.
+# Dependencies are installed in the local .venv, so the Space's runtime
+# pip-install step is gone.  The versions it pinned still matter:
+# transformers must be 4.57.1 -- the model's remote code predates the
+# transformers 5 rewrite, and under 5.x it loads but silently produces garbage
+# (the tokenizer is rebuilt with SentencePiece processing that eats every
+# space).  pip will warn that gradio wants huggingface-hub>=1.16; that bound is
+# metadata only and gradio 6.24 runs fine against the 0.36 transformers needs.
 # ──────────────────────────────────────────────────────────────────────────────
-_RUNTIME_PKGS = [
-    "torch==2.10.0",
-    "torchvision==0.25.0",
-    "transformers==4.57.1",
-]
 
-print("Installing pinned runtime dependencies...")
-subprocess.run(
-    [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir"] + _RUNTIME_PKGS,
-    check=True,
-)
-print("Runtime deps installed.")
+# The model streams text containing full-width CJK punctuation.  A Windows
+# console defaults to a legacy codepage, where writing that raises
+# UnicodeEncodeError and kills the inference thread mid-generation.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 # ── Now safe to import ────────────────────────────────────────────────────────
 import torch
@@ -29,14 +28,34 @@ from transformers import AutoModel, AutoTokenizer, TextIteratorStreamer
 from gradio import Server
 from gradio.data_classes import FileData
 from fastapi.responses import HTMLResponse
-import spaces
+from fastapi.staticfiles import StaticFiles
+try:
+    import spaces
+except ImportError:
+    # Running locally: no ZeroGPU scheduler, just use the GPU we already own.
+    class _LocalSpaces:
+        @staticmethod
+        def GPU(*d_args, **d_kwargs):
+            # Support both @spaces.GPU and @spaces.GPU(duration=60).
+            if len(d_args) == 1 and callable(d_args[0]) and not d_kwargs:
+                return d_args[0]
+            return lambda fn: fn
+
+    spaces = _LocalSpaces()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Model loading
 # Per ZeroGPU docs: place model on cuda at module level.
 # ZeroGPU emulation mode lets .cuda() work at startup without a real GPU.
 # ──────────────────────────────────────────────────────────────────────────────
-MODEL_NAME = "baidu/Unlimited-OCR"
+MODEL_NAME = os.environ.get("UNLIMITED_OCR_MODEL", "baidu/Unlimited-OCR")
+
+if not torch.cuda.is_available():
+    raise SystemExit(
+        "No CUDA device found. This model needs a GPU - check that the installed "
+        "torch build matches your driver."
+    )
+print(f"Using GPU: {torch.cuda.get_device_name(0)}")
 
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -45,7 +64,7 @@ model = AutoModel.from_pretrained(
     MODEL_NAME,
     trust_remote_code=True,
     use_safetensors=True,
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
 ).eval().cuda()
 print("Model ready.")
 
@@ -219,6 +238,29 @@ def explode_pdf(pdf_file: FileData) -> dict:
     return {"pages": [{"path": p, "orig_name": os.path.basename(p)} for p in pages]}
 
 
+# ── Vendored frontend deps ────────────────────────────────────────────────────
+# index.html used to pull @gradio/client, pdf.js and Google Fonts from CDNs,
+# which made the UI depend on internet access. They are checked into vendor/
+# and served here.
+#
+# The MIME types are registered explicitly: Python reads these from the Windows
+# registry, where .js is often mapped to text/plain, and .mjs is usually absent
+# entirely. Either one makes the browser refuse the module with a strict-MIME
+# error, so don't rely on the system mapping.
+mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("text/css", ".css")
+mimetypes.add_type("font/woff2", ".woff2")
+mimetypes.add_type("application/octet-stream", ".bcmap")
+mimetypes.add_type("application/octet-stream", ".pfb")
+
+app.mount(
+    "/vendor",
+    StaticFiles(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")),
+    name="vendor",
+)
+
+
 # ── Static frontend ───────────────────────────────────────────────────────────
 @app.get("/")
 async def homepage():
@@ -227,4 +269,8 @@ async def homepage():
         return HTMLResponse(content=f.read())
 
 
-app.launch(show_error=True)
+app.launch(
+    server_name=os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1"),
+    server_port=int(os.environ.get("GRADIO_SERVER_PORT", 7860)),
+    show_error=True,
+)

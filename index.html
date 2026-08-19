@@ -5,9 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Unlimited OCR – Baidu</title>
   <meta name="description" content="Unlimited OCR: One-shot long-horizon document parsing powered by Baidu's vision-language model." />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <!-- Served from vendor/ by app.py -- no CDN, so this page works offline. -->
+  <link href="/vendor/fonts.css" rel="stylesheet" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -362,10 +361,20 @@
 <div class="toast" id="toast"></div>
 
 <script type="module">
-import { Client, handle_file } from "https://cdn.jsdelivr.net/npm/@gradio/client/dist/index.min.js";
-import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs";
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs";
+// Served from vendor/ by app.py -- no CDN, so this page works offline.
+import { Client, handle_file } from "/vendor/gradio-client.min.js";
+import * as pdfjsLib from "/vendor/pdf.min.mjs";
+pdfjsLib.GlobalWorkerOptions.workerSrc = "/vendor/pdf.worker.min.mjs";
+
+// Passed to every getDocument() call. Without these, a PDF that references a
+// standard PostScript font it does not embed, or a CJK encoding, renders with
+// substituted glyphs. pdf.js resolves both lazily, so nothing is fetched unless
+// a document actually needs it. cMapPacked flags the .bcmap binary format.
+const PDFJS_ASSETS = {
+  cMapUrl: "/vendor/pdfjs/cmaps/",
+  cMapPacked: true,
+  standardFontDataUrl: "/vendor/pdfjs/standard_fonts/",
+};
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let client        = null;
@@ -446,7 +455,10 @@ async function loadFile(file) {
     document.getElementById('page-info').style.display = 'flex';
 
     const buffer = await file.arrayBuffer();
-    const pdf    = await pdfjsLib.getDocument({ data: buffer }).promise;
+    const pdf    = await pdfjsLib.getDocument({
+      data: buffer,
+      ...PDFJS_ASSETS,
+    }).promise;
     const total  = pdf.numPages;
     document.getElementById('page-count').textContent = total;
     wrap.innerHTML = '';
